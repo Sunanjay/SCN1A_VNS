@@ -1,0 +1,583 @@
+#VNS data analysis in SCN1A patients
+
+#Load libraries
+library(tidyverse)
+library(ggpubr)
+library(gridExtra)
+library(lme4)
+library(lmerTest)
+library(broom.mixed)
+library(broom)
+
+#Read files
+raw_char <- read.csv("data/VNS_Characteristics.csv")
+raw_MCSFother <- read.csv("data/VNS_MCSF_others.csv")
+raw_MCSFgtc <- read.csv("data/VNS_MCSF_GTC.csv")
+raw_genotype <- read.csv("data/VNS_Genotype.csv")
+raw_VNS <- read.csv("data/VNS_Settings.csv")
+raw_meds <- read.csv("data/VNS_medications.csv")
+
+
+#======= Get basic statistics for Table 1 ========#
+table_char <- raw_char [,c("UID", "Age_group", "Sex", "Race", "BMI_group", "Zygosity", "Phenotype_assessed", "Age_at_onset_month", "Seizure_type_at_onset", "Follow_up_VNS_Months", "Follow_up_months", "Epilepsy_intervention_months")]
+table_genotype <- raw_genotype [,c("UID", "Predicted_function")]
+
+#Create data frame with all required columns
+table_all <- table_char %>%
+  left_join(table_genotype, by = "UID")
+
+table_all <- table_all %>%
+  dplyr::filter(!is.na(Age_at_onset_month))
+
+#Select which columns require median and count
+median_col <- c("Follow_up_VNS_Months", "Follow_up_months", "Age_at_onset_month", "Epilepsy_intervention_months")
+count_col <- c("Age_group", "Sex", "Race", "BMI_group", "Zygosity", "Predicted_function", "Phenotype_assessed", "Seizure_type_at_onset")
+
+#Create medians
+median_results <- sapply(median_col, function(col) median(table_all[[col]]))
+median_df <- as.data.frame(t(median_results))
+median_df$Metric <- "Median"
+
+#Create counts
+count_results <- lapply(count_col, function (col) {
+  tab <- table(table_all [[col]], useNA = "ifany")
+  data.frame(Count = as.vector(tab),
+             Precentage = as.vector (tab) / sum(tab) * 100,
+             row.names = names(tab))
+})
+
+print(count_results)
+
+
+#======== Create VNS Data master file ========== #
+#Files corrected for relevant info
+clean_char <- raw_char[,c("UID", "Phenotype_assessed","Age_at_onset_month", "Epilepsy_intervention_months")]
+clean_MCSFother <- raw_MCSFother [, !names(raw_MCSFother) %in% c("End", "Comments")]
+clean_MCSFgtc <- raw_MCSFgtc [,c("UID", "MCSF", "Start_age_months", "End_age_months")]
+clean_genotype <- raw_genotype [,c("UID", "Predicted_ACMG_pipeline", "Predicted_function")]
+
+#Create combined characteristics and genotype
+full_char <- clean_char %>%
+  left_join(clean_genotype, by = "UID")
+
+#Add missing column GTC to MCSF file
+clean_MCSFgtc$Seizure_type <- "GTC"
+
+#Remove NA from MCSF frames
+clean_MCSFother <- clean_MCSFother %>%
+  dplyr::filter(!is.na(Start_age_months) & !is.na(End_age_months))
+
+clean_MCSFgtc <- clean_MCSFgtc %>%
+  dplyr::filter(!is.na(Start_age_months) & !is.na(End_age_months))
+
+#Function to expand the month ranges
+expand_month_range <- function (UID, Seizure_type, MCSF, Start_age_months, End_age_months) {
+  data.frame(
+    UID = UID,
+    Seizure_type = Seizure_type,
+    Month = Start_age_months:End_age_months,
+    MCSF = MCSF
+  )
+}
+
+#Expand month ranges for MCSF other
+expanded_MCSFother <- clean_MCSFother %>%
+  rowwise() %>%
+  do(expand_month_range(.$UID, .$Seizure_type, .$MCSF, .$Start_age_months, .$End_age_months)) %>%
+  ungroup()
+
+#Expand month ranges for MCSF GTC
+expanded_MCSFgtc <- clean_MCSFgtc %>%
+  rowwise() %>%
+  do(expand_month_range(.$UID, .$Seizure_type, .$MCSF, .$Start_age_months, .$End_age_months)) %>%
+  ungroup()
+
+#Combine the expanded data
+combined_MCSF <- bind_rows(expanded_MCSFgtc, expanded_MCSFother)
+
+#Remove duplicates by keeping first number only
+unique_combined_MCSF <- combined_MCSF %>%
+  group_by(UID, Month, Seizure_type) %>%
+  summarise(MCSF = first(MCSF), .groups = 'drop') %>%
+ungroup()
+
+#Spread the combined data
+spread_combined_MCSF <- unique_combined_MCSF %>%
+  spread(key=Seizure_type, value = MCSF)
+
+#Group by Id and month to ensure single occurrence
+final_MCSF <- spread_combined_MCSF %>%
+  group_by(UID, Month) %>%
+  summarise_all(first) %>%
+  ungroup()
+
+#Combine MCSF and characteristics frames
+final_master <- final_MCSF %>%
+  left_join(full_char, by = "UID")
+
+#Create VNS Y/N column and remove the VNS month
+final_master <- final_master%>%
+  mutate(VNS_implanted = ifelse(Month < Epilepsy_intervention_months, "no", "yes"))%>%
+  select(-Epilepsy_intervention_months)%>%
+  select(UID, Predicted_ACMG_pipeline, Predicted_function, Phenotype_assessed, Age_at_onset_month, Month, VNS_implanted, everything())
+
+#Create a sum column for all seizure types
+final_master <- final_master %>%
+  mutate(All_seizures = rowSums(select(.,Asymmetric_tonic, Atonic, Dialeptic, Focal_motor, Focal_motor_2, GTC, Myoclonic), na.rm = TRUE))
+
+#Create csv
+write.csv(final_master, "output/final_master.csv", row.names = FALSE)
+
+
+#====== Calculate responders ======#
+
+#Create new frame with median for pre, 12-month post and all_post
+grouped_master <- final_master %>%
+  group_by(UID)%>%
+  mutate(VNS_month = min(Month[VNS_implanted == "yes"], na.rm = TRUE),
+         VNS_period = case_when(
+           Month > VNS_month - 12 & Month <= VNS_month ~ "Pre_VNS",
+           Month >VNS_month +2 & Month <= VNS_month +14 ~ "ST_VNS_FU",
+           Month >VNS_month +2 & Month <= VNS_month +122 ~ "LT_VNS_FU"
+         ))
+grouped_master_filtered <- grouped_master[!is.na(grouped_master$VNS_period),]
+
+# Identify rows that need to be duplicated
+duplicated_rows <- grouped_master_filtered %>%
+  filter(VNS_period == "ST_VNS_FU" & Month <= VNS_month + 14 & Month > VNS_month + 2) %>%
+  mutate(VNS_period = "LT_VNS_FU")
+
+# Combine the original data with the duplicated rows
+grouped_master_combined <- bind_rows(
+  grouped_master_filtered,
+  duplicated_rows %>%
+    mutate(VNS_period = "LT_VNS_FU")  # Add rows with Long_Term period
+)
+
+# Arrange the dataframe by UID and Month (or any other column if needed)
+grouped_master_combined <- grouped_master_combined %>%
+  arrange(UID, Month)
+
+#calculate medians
+responder_grouped <- grouped_master_combined %>%
+  group_by(UID, VNS_period) %>%
+  summarise(median_amount = median(All_seizures, na.rm=TRUE)) %>%
+  ungroup()
+
+
+responder_grouped_wide <- responder_grouped %>%
+  pivot_wider(names_from = VNS_period, values_from = median_amount)
+
+#Select responders
+responder_grouped_wide <- responder_grouped_wide %>%
+  mutate(
+    responder_ST = ifelse(!is.na(Pre_VNS) & !is.na(ST_VNS_FU) & ST_VNS_FU <= 0.5*Pre_VNS, "Responder", "Non-Responder"),
+    responder_LT = ifelse(!is.na(Pre_VNS) & !is.na(LT_VNS_FU) & LT_VNS_FU <= 0.5*Pre_VNS, "Responder", "Non-Responder")
+  ) %>%
+  select(UID, responder_ST, responder_LT)
+
+grouped_master_responder <- grouped_master_combined %>%
+  left_join(responder_grouped_wide %>% select(UID, responder_ST, responder_LT), by = "UID")
+
+#Summarize responders
+count_responder_ST_grouped <- grouped_master_responder %>%
+  group_by(responder_ST) %>%
+  summarise(count= n_distinct (UID)) %>%
+  mutate(percentage = count/n_distinct(grouped_master_responder$UID)*100)
+
+count_responder_LT_grouped <- grouped_master_responder %>%
+  group_by(responder_LT) %>%
+  summarise(count= n_distinct (UID)) %>%
+  mutate(percentage = count/n_distinct(grouped_master_responder$UID)*100)
+
+summary_responder_grouped <- bind_rows(
+  count_responder_ST_grouped %>% mutate(responder_type = "ST"),
+  count_responder_LT_grouped %>% mutate(responder_type = "LT")
+)
+
+summary_responder_grouped <- summary_responder_grouped %>%
+  mutate(responder_status = case_when(
+    !is.na(responder_ST) & responder_ST != "NA" ~ responder_ST,
+    !is.na(responder_LT) & responder_LT != "NA" ~ responder_LT,
+    TRUE ~ NA_character_
+  )) %>%
+  select(-responder_ST, -responder_LT)
+
+#Save counts
+write.csv(summary_responder_grouped, "output/Responder_grouped.csv", row.names = FALSE)
+
+#Create directory for bar charts
+new_dir_path2 <- file.path(getwd(), "output", "barplots")
+dir.create(new_dir_path2)
+
+#Create Bar charts
+Barplot_all <- ggplot(summary_responder_grouped, aes (x = responder_type, y = count, fill = responder_status))+
+  geom_col(width = 0.8, color = "white")+
+  geom_text(aes(label=count),
+            vjust=-0.5, color = "black") +
+  geom_text(aes(label = paste0(round(percentage, 1), "%")), 
+            vjust = 1.5, color = "white") + 
+  scale_fill_brewer(palette = "Dark2")+
+  theme_void()+
+  labs(title = "Responders",
+       x= "Period")+
+  guides(fill = guide_legend(title = "Responder"))+
+  scale_fill_discrete(labels = c("No", "Yes"))+
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.text.x = element_text(hjust=1, margin = margin(t = 10)),
+    axis.line.x = element_line(color = "black", size = 0.5, lineend = "butt")
+  )
+
+print(Barplot_all)
+
+#save files
+ggsave(Barplot_all, filename = "output/barplots/Barplot_Responders.pdf", device = "pdf", height = 8, width = 6, units = "in")
+
+
+#========== Create Responder supplementary table ======#
+
+responder_char <- responder_grouped_wide %>%
+  left_join(full_char, by = "UID")
+
+write.csv(responder_char, "output/Responder_characteristics.csv", row.names = FALSE)
+
+#=========== Calculate Median Log fold changes  ============#
+
+#Create log transformed seizure values
+grouped_master_combined$Log_All_seizures <- log1p(grouped_master_combined$All_seizures)
+
+#Create factored data
+grouped_master_combined$VNS_period <- factor(grouped_master_combined$VNS_period, levels = c("Pre_VNS", "ST_VNS_FU", "LT_VNS_FU"))
+
+log_seizure_changes <- grouped_master_combined %>%
+  group_by(UID, VNS_period) %>%
+  summarize(median_log_seizures = median(Log_All_seizures, na.rm = TRUE)) %>%
+  spread(key = VNS_period, value = median_log_seizures) %>%
+  mutate(
+    change_Pre_to_ST = ST_VNS_FU - Pre_VNS,
+    change_Pre_to_LT = LT_VNS_FU - Pre_VNS,
+  )
+
+# Step 2: Calculate the median of log changes across all patients
+median_log_changes <- log_seizure_changes %>%
+  summarize(
+    median_change_Pre_to_ST = median(change_Pre_to_ST, na.rm = TRUE),
+    median_change_Pre_to_LT = median(change_Pre_to_LT, na.rm = TRUE),
+  )
+
+median_values <- median_log_changes %>%
+  summarize(
+    median_Pre_to_ST = median(median_change_Pre_to_ST, na.rm = TRUE),
+    median_Pre_to_LT = median(median_change_Pre_to_LT, na.rm = TRUE)
+  )
+print(median_values)
+
+write.csv(median_log_changes, "output/Log_fold_changes.csv", row.names = FALSE)
+
+
+#=========== Create Violin Plots ============#
+
+#Create violin for grouped data
+combined_violin <- ggplot(grouped_master_combined, aes(x = VNS_period, y = Log_All_seizures, color = VNS_period)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.1, fill = "white") +
+  theme_minimal() +
+  labs(title = "Log-transformed Seizures by VNS Period",
+       x = "VNS_period",
+       y = "Log (1+All Seizures)")
+
+combined_violin_withp <- combined_violin +
+  stat_compare_means(comparisons = list(c("Pre_VNS", "ST_VNS_FU"), c("Pre_VNS", "LT_VNS_FU"), c("ST_VNS_FU", "LT_VNS_FU")),
+                     method = "wilcox.test",
+                     label = "p.signif")
+
+# Save the basic plot to check for issues
+ggsave(combined_violin_withp, filename = "output/combined_violin_plot.pdf", device="pdf",  width = 5, height = 5, units = "in")
+
+#Get p-values for grouped data
+grouped_p_values <- list()
+
+test_PreVsST <- wilcox.test(Log_All_seizures ~ VNS_period, data = grouped_master_combined %>% dplyr::filter(VNS_period %in% c("Pre_VNS", "ST_VNS_FU")))
+grouped_p_values[["PreVsST"]] <-test_PreVsST$p.value
+
+test_PreVsLT <- wilcox.test(Log_All_seizures ~ VNS_period, data = grouped_master_combined %>% dplyr::filter(VNS_period %in% c("Pre_VNS", "LT_VNS_FU")))
+grouped_p_values[["PreVsLT"]] <-test_PreVsLT$p.value
+
+test_STvsLT <- wilcox.test(Log_All_seizures ~ VNS_period, data = grouped_master_combined %>% dplyr::filter(VNS_period %in% c("ST_VNS_FU", "LT_VNS_FU")))
+grouped_p_values[["STvsLT"]] <-test_STvsLT$p.value
+
+grouped_p_values_df <- data.frame(
+  Comparison = names(grouped_p_values),
+  P_value = unlist(grouped_p_values)
+)
+row.names(grouped_p_values_df) = NULL
+write.csv(grouped_p_values_df, "output/Grouped_P_values.csv", row.names = FALSE)
+
+
+
+#====== Create Longitudinal Z-score plots=======#
+
+#Create Spaghetti Plot for 12 month pre and long-term (10yrs)
+#Normalize months
+z_divided_filtered <- grouped_master_combined %>%
+  group_by(UID) %>%
+  mutate(normalized_month = Month - (VNS_month +1)) %>%
+  ungroup()
+
+# Calculate z scores
+z_divided_filtered <- z_divided_filtered %>%
+  group_by(UID) %>%
+  mutate(z_score = scale(All_seizures)) %>%
+  ungroup()
+
+#Wilcoxon Test for z-score
+z_divided_filtered_summary <- z_divided_filtered %>%
+  group_by(UID, VNS_period)%>%
+  summarise(mean_z = mean(z_score), sd_z = sd(z_score))%>%
+  ungroup()
+
+z_p_values <- wilcox.test(
+  z_divided_filtered_summary$mean_z[z_divided_filtered_summary$VNS_period == "Pre_VNS"],
+  z_divided_filtered_summary$mean_z[z_divided_filtered_summary$VNS_period == "LT_VNS_FU"],
+)
+
+#Z-score plot
+z_plot <- ggplot(z_divided_filtered, aes(x = normalized_month, y = z_score, group = UID)) +
+  geom_line(color = "lightgrey", alpha = 0.5) +  # Light grey individual trajectories
+  stat_summary(fun = mean, geom = "line", aes(group = 1), color = "firebrick", size = 1.2) +  # Mean trajectory
+  stat_summary(fun.data = mean_se, geom = "ribbon", 
+               aes(ymin = ..ymin.., ymax = ..ymax.., group = 1), 
+               fill = "lightcoral", alpha = 0.2) +  # SD ribbon
+  geom_vline(xintercept = 0, linetype = "dashed", color = "blue") +  # Event line
+  scale_x_continuous(breaks = seq(min(z_divided_filtered$normalized_month, na.rm = TRUE), 
+                                  max(z_divided_filtered$normalized_month, na.rm = TRUE), 
+                                  by = 12)) +  # Adjust x-axis to show every 6 months
+  theme_minimal() +
+  annotate("text", x = mean(z_divided_filtered$normalized_month), y = max(z_divided_filtered$z_score),
+           label =  if(z_p_values$p.value <0.0001) paste("p-value = <0.0001") else paste ("p-value =", round(z_p_values$p.value, 4)),
+           hjust = 0, vjust = 1) +
+  labs(title = "Z-score Normalized Seizure Burden",
+       x = "Months Relative to Event",
+       y = "Z-score of Seizure Counts")+
+  theme(panel.grid.major = element_blank(),  
+        panel.grid.minor = element_blank(),
+        axis.line.x = element_line(color = "black"), 
+        axis.ticks = element_line(color = "black"))  
+
+print(z_plot)
+ggsave(z_plot, filename = "output/zplots/zsore_all_new.pdf", device = "pdf", width = 8, height = 5, units = "in" )
+
+
+#Create Spaghetti Plot for 12 month pre and post
+#Normalize months
+z_grouped_filtered <- grouped_master_combined %>%
+  group_by(UID) %>%
+  mutate(normalized_month = Month - (VNS_month +1)) %>%
+  ungroup()
+
+# Calculate z scores
+z_grouped_filtered <- z_grouped_filtered %>%
+  group_by(UID) %>%
+  mutate(z_score = scale(All_seizures)) %>%
+  ungroup()
+
+#Wilcoxon Test for z-score
+z_grouped_filtered_summary <- z_grouped_filtered %>%
+  group_by(UID, VNS_period)%>%
+  summarise(mean_z = mean(z_score), sd_z = sd(z_score))%>%
+  ungroup()
+
+z_st_p_values <- wilcox.test(
+  z_grouped_filtered_summary$mean_z[z_grouped_filtered_summary$VNS_period == "Pre_VNS"],
+  z_grouped_filtered_summary$mean_z[z_grouped_filtered_summary$VNS_period == "ST_VNS_FU"],
+)
+
+z_grouped_filtered_st <- z_grouped_filtered %>%
+filter(VNS_period %in% c("Pre_VNS", "ST_VNS_FU"))
+
+#Z-score plot
+z_plot_st <- ggplot(z_grouped_filtered_st, aes(x = normalized_month, y = z_score, group = UID)) +
+  geom_line(color = "lightgrey", alpha = 0.5) +  # Light grey individual trajectories
+  stat_summary(fun = mean, geom = "line", aes(group = 1), color = "firebrick", size = 1.2) +  # Mean trajectory
+  stat_summary(fun.data = mean_se, geom = "ribbon", 
+               aes(ymin = ..ymin.., ymax = ..ymax.., group = 1), 
+               fill = "lightcoral", alpha = 0.2) +  # SD ribbon
+  geom_vline(xintercept = 0, linetype = "dashed", color = "blue") +  # Event line
+  scale_x_continuous(breaks = seq(min(z_grouped_filtered_st$normalized_month, na.rm = TRUE), 
+                                  max(z_grouped_filtered_st$normalized_month, na.rm = TRUE), 
+                                  by = 3)) +  # Adjust x-axis to show every 6 months
+  theme_minimal() +
+  annotate("text", x = mean(z_grouped_filtered_st$normalized_month), y = max(z_grouped_filtered_st$z_score),
+           label =  if(z_st_p_values$p.value <0.0001) paste("p-value = <0.0001") else paste ("p-value =", round(z_st_p_values$p.value, 5)),
+           hjust = 0, vjust = 1) +
+  labs(title = "Z-score Normalized Seizure Burden (short term)",
+       x = "Months Relative to Event",
+       y = "Z-score of Seizure Counts")+
+  theme(panel.grid.major = element_blank(),  
+        panel.grid.minor = element_blank(),
+        axis.line.x = element_line(color = "black"), 
+        axis.ticks = element_line(color = "black"))  
+
+print(z_plot_st)
+ggsave(z_plot_st, filename = "output/zplots/zsore_ST_new.pdf", device = "pdf", width = 8, height = 5, units = "in" )
+
+
+#==================================== Linear Regression ===================================#
+clean_meds <- raw_meds [, !names(raw_meds) %in% c("Comments")]
+
+#Function to expand the month ranges for meds
+expand_month_meds <- function(data) {
+  data %>%
+    rowwise() %>%
+    mutate(Month = list(seq(Start_age_months, End_age_months))) %>%
+    unnest(Month) %>%
+    select(UID, Medication, Medication_group, Month)
+}
+
+#Expand months for meds
+expanded_meds <- expand_month_meds(clean_meds)
+
+expanded_meds <- expanded_meds %>%
+  arrange (UID, Month)
+
+#Get counts of meds
+counts_meds <- expanded_meds %>%
+  group_by(UID, Month, Medication_group)%>%
+  summarise(Med_Count  = n_distinct(Medication), .groups = 'drop')%>%
+  pivot_wider(names_from = Medication_group, values_from = Med_Count, values_fill = list(Med_Count = 0))
+
+#Create master with Log (seizures) and meds
+grouped_selected <- grouped_master_combined [, c("UID", "Month", "Log_All_seizures", "VNS_period" )]
+
+regression_master <- grouped_selected %>%
+  left_join(counts_meds)
+
+regression_master <- regression_master%>%
+  dplyr::filter(!is.na(Serotonin_Agonist))
+
+
+#Split into separate columns and create dataframes for  LT
+regression_master_LT <- regression_master
+regression_master_LT <- regression_master_LT %>%
+  filter(VNS_period != "ST_VNS_FU")
+regression_master_LT$VNS_period <- ifelse(regression_master_LT$VNS_period == "Pre_VNS", 0, 1)
+
+#Make VNS continuous variable
+regression_master_continuous <- regression_master_LT %>%
+  group_by(UID) %>%
+  mutate(
+    VNS_month = ifelse (VNS_period == 0, 0,
+                                    row_number() - which.max(VNS_period == 1) + 1)
+  ) %>%
+  ungroup()%>%
+  select(UID, Month, Log_All_seizures, VNS_month, everything())
+
+#Calculate duty cycle and filter VNS_all for the parameters needed
+VNS_selected <- VNS_all %>%
+  group_by(UID) %>%
+  mutate(Generator_off_time_sec = Generator_off_time_min * 60) %>%
+  mutate(Duty_cycle = (Generator_on_time_sec/(Generator_on_time_sec + Generator_off_time_sec))) %>%
+  select(UID, MonthsFromImplantation, Generator_output_current_mA, Duty_cycle)%>%
+  dplyr::filter(MonthsFromImplantation !=0)%>%
+  rename(VNS_month = MonthsFromImplantation)
+
+#Filter first 2 months and fill in values for months between interrogations
+VNS_selected <- VNS_selected[!(VNS_selected$VNS_month %in% c(1,2)),]
+VNS_selected$VNS_month <- ifelse(VNS_selected$VNS_month > 2, VNS_selected$VNS_month - 2, VNS_selected$VNS_month)
+VNS_selected <- VNS_selected %>% 
+  distinct(UID, VNS_month, .keep_all = TRUE)
+VNS_selected <- VNS_selected %>%
+  group_by(UID) %>%
+  arrange(VNS_month) %>%
+  complete(VNS_month = seq(min(VNS_month), max (VNS_month), by = 1))%>%
+  fill(Generator_output_current_mA, Duty_cycle, .direction = "down")
+
+regression_master_continuous <- regression_master_continuous %>%
+  full_join(VNS_selected, by = c("UID", "VNS_month"), relationship = "many-to-many")
+
+#Write all CSV
+write.csv(regression_master, file = "output/regression_master.csv", row.names = FALSE)
+write.csv(regression_master_LT, file = "output/regression_master_LT.csv", row.names = FALSE)
+write.csv(regression_master_continuous, file = "output/regression_master_continuous.csv", row.names = FALSE)
+
+
+#Create model with binary VNS variable
+model_binary <- lmer(Log_All_seizures ~ SV2A_Inhibitor + GABA_Agonist + Multi_Receptor + Sodium_Antagonist + Cannabinoid_Agonist + Calcium_Antagonist + Serotonin_Agonist + VNS_period + (1 | UID), data = regression_master_continuous)
+summary (model_binary)
+
+model_binary_summary <- summary(model_binary)
+coefficients_binary <- as.data.frame(model_binary_summary$coefficients)
+random_effects_binary <- ranef(model_binary)
+random_effects_binary_df <- as.data.frame(random_effects_binary)
+write.csv(coefficients_binary, file = "output/model_coefficients_summary_binary.csv", row.names = TRUE)
+write.csv(random_effects_binary_df, file = "output/model_random_effects_summary_binary.csv", row.names = TRUE)
+
+#Create model with VNS duration and parameters
+model_duration <- lmer(Log_All_seizures ~ SV2A_Inhibitor + GABA_Agonist + Multi_Receptor + Sodium_Antagonist + Cannabinoid_Agonist + Calcium_Antagonist + Serotonin_Agonist + VNS_month + Duty_cycle + Generator_output_current_mA + (1 | UID), data = regression_master_continuous)
+summary (model_duration )
+
+model_duration_summary <- summary(model_duration)
+coefficients_duration <- as.data.frame(model_duration_summary$coefficients)
+random_effects_duration <- ranef(model_duration)
+random_effects_duration_df <- as.data.frame(random_effects_duration)
+write.csv(coefficients_duration, file = "output/model_coefficients_summary_duration.csv", row.names = TRUE)
+write.csv(random_effects_duration_df, file = "output/model_random_effects_summary_duration.csv", row.names = TRUE)
+
+
+#Create Binary Model Summary
+model_summary_binary_vis <- tidy(model_binary, effects = "fixed", conf.int=TRUE)
+model_summary_binary_vis$estimate_sign <- ifelse(model_summary_binary_vis$estimate > 0, "Positive Estimate", "Negative Estimate")
+
+reg_plot_binary <- ggplot(model_summary_binary_vis, aes(x = estimate, y = term, xmin = conf.low, xmax = conf.high, color = estimate_sign)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey") + 
+  geom_point(size = 2.5) +
+  geom_errorbarh(height = 0.2) + 
+  scale_color_manual(
+    values = c("Positive Estimate" = "steelblue", "Negative Estimate" = "firebrick"),
+    labels = c("Negative Estimate", "Positive Estimate")) +
+  geom_text(aes(label = ifelse(p.value < 0.0001, "<0.0001", sprintf("p = %.3f", p.value))), 
+            hjust = 0.5, vjust = -1.2, size = 3.5, check_overlap = TRUE) +
+  labs(title = "Regression Coefficients with 95% CI",
+       x = "Estimate",
+       y = "Term",
+       color = "Estimate Direction") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(), 
+    panel.background = element_blank(), 
+    axis.line = element_line(colour = "black"),
+    legend.position = "bottom")
+
+ggsave(reg_plot_binary, filename = "output/regression/Coefficients_binary.pdf", device = "pdf", width = 9, height = 6)
+
+
+#Create Duration Model Summary
+model_summary_duration_vis <- tidy(model_duration, effects = "fixed", conf.int=TRUE)
+model_summary_duration_vis$estimate_sign <- ifelse(model_summary_duration_vis$estimate > 0, "Positive Estimate", "Negative Estimate")
+model_summary_duration_vis$term <- factor(model_summary_duration_vis$term,
+                                          levels = c ("Intercept", "Calcium_Antagonist", "Cannabinoid_Agonist", "GABA_Agonist", "Multi_Receptor", "Serotonin_Agonist",  "Sodium_Antagonist",  "SV2A_Inhibitor", "Generator_output_current_mA", "Duty_cycle", "VNS_month"))
+
+reg_plot_duration <- ggplot(model_summary_duration_vis, aes(x = estimate, y = term, xmin = conf.low, xmax = conf.high, color = estimate_sign)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey") + 
+  geom_point(size = 2.5) +
+  geom_errorbarh(height = 0.2) + 
+  scale_color_manual(
+    values = c("Positive Estimate" = "steelblue", "Negative Estimate" = "firebrick"),
+    labels = c("Negative Estimate", "Positive Estimate")) +
+  geom_text(aes(label = ifelse(p.value < 0.0001, "<0.0001", sprintf("p = %.3f", p.value))), 
+            hjust = 0.5, vjust = -1.2, size = 3.5, check_overlap = TRUE) +
+  labs(title = "Regression Coefficients with 95% CI",
+       x = "Estimate",
+       y = "Term",
+       color = "Estimate Direction") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(), 
+    panel.background = element_blank(), 
+    axis.line = element_line(colour = "black"),
+    legend.position = "bottom")
+
+ggsave(reg_plot_duration, filename = "output/regression/Coefficients_duration.pdf", device = "pdf", width = 9, height = 6)
+
+
